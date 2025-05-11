@@ -1,0 +1,160 @@
+name: Build, Test, and Deploy
+
+on:
+  push:
+    branches: [ main ]
+  release:
+    types: [created]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOYMENT_ENV: production
+  DOCKER_COMPOSE_FILE: docker-compose.prod.yml
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Update project version
+        run: |
+          sed -i "s/<Version>.*<\/Version>/<Version>${{ steps.version.outputs.version }}<\/Version>/g" myfirstapi.csproj
+          sed -i "s/<AssemblyVersion>.*<\/AssemblyVersion>/<AssemblyVersion>${{ steps.version.outputs.version }}<\/AssemblyVersion>/g" myfirstapi.csproj
+          sed -i "s/<FileVersion>.*<\/FileVersion>/<FileVersion>${{ steps.version.outputs.version }}<\/FileVersion>/g" myfirstapi.csproj
+
+      - name: Run tests
+        run: dotnet test
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.repository_url }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+  deploy:
+    needs: build-test-push
+    runs-on: ubuntu-latest
+    environment: ${{ env.DEPLOYMENT_ENV }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Docker Compose
+        run: |
+          sudo curl -L "https://github.com/docker/compose/releases/download/v2.23.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+
+      - name: Configure deployment
+        id: config
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "DEPLOYMENT_ID=${VERSION}" >> $GITHUB_ENV
+
+      - name: Set up zero-downtime deployment
+        env:
+          DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.config.outputs.version }}
+          CURRENT_SERVICE: weather-api-${{ env.DEPLOYMENT_ID }}
+          TRAEFIK_NETWORK: traefik_network
+        run: |
+          # Create docker-compose file for blue-green deployment
+          cat <<EOT > ${{ env.DOCKER_COMPOSE_FILE }}
+          version: '3.8'
+          
+          networks:
+            ${{ env.TRAEFIK_NETWORK }}:
+              external: true
+
+          services:
+            ${{ env.CURRENT_SERVICE }}:
+              image: ${{ env.DOCKER_IMAGE }}
+              deploy:
+                replicas: 2
+                update_config:
+                  order: start-first
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8080/api/hello"]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+                start_period: 30s
+              networks:
+                - ${{ env.TRAEFIK_NETWORK }}
+              labels:
+                - "traefik.enable=true"
+                - "traefik.http.routers.${{ env.CURRENT_SERVICE }}.rule=Host(\`weather-api.example.com\`)"
+                - "traefik.http.routers.${{ env.CURRENT_SERVICE }}.entrypoints=websecure"
+                - "traefik.http.routers.${{ env.CURRENT_SERVICE }}.tls=true"
+                - "traefik.http.services.${{ env.CURRENT_SERVICE }}.loadbalancer.server.port=8080"
+              environment:
+                - ASPNETCORE_ENVIRONMENT=Production
+                - ASPNETCORE_URLS=http://+:8080
+          EOT
+
+          # Initialize Traefik if not exists
+          if ! docker network inspect ${{ env.TRAEFIK_NETWORK }} &>/dev/null; then
+            docker network create ${{ env.TRAEFIK_NETWORK }}
+            docker-compose -f traefik-compose.yml up -d
+          fi
+
+          # Deploy new version
+          docker-compose -f ${{ env.DOCKER_COMPOSE_FILE }} up -d
+
+          # Wait for new version to be healthy
+          while ! docker-compose -f ${{ env.DOCKER_COMPOSE_FILE }} ps | grep -q "(healthy)"; do
+            echo "Waiting for new version to become healthy..."
+            sleep 5
+          done
+
+          # Remove old containers (if any)
+          OLD_CONTAINERS=$(docker ps -a --filter "name=weather-api-" --format "{{.Names}}" | grep -v "${{ env.CURRENT_SERVICE }}")
+          if [ -n "$OLD_CONTAINERS" ]; then
+            docker stop $OLD_CONTAINERS
+            docker rm $OLD_CONTAINERS
+          fi
+
+          echo "Deployment completed successfully!"
+
+      - name: Verify deployment
+        run: |
+          curl -s https://weather-api.example.com/api/hello
+          echo ""

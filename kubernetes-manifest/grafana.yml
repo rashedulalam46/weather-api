@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  weather-api.json: |-
+    {
+      "title": "Weather API Dashboard",
+      "panels": [
+        {
+          "title": "Request Rate",
+          "type": "graph",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "rate(weather_api_requests_total[1m])",
+              "legendFormat": "{{handler}}"
+            }
+          ]
+        }
+      ]
+    }

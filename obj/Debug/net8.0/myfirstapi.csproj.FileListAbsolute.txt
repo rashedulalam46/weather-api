@@ -31,3 +31,4 @@ D:\Project\BS Project\myfirstapi\obj\Debug\net8.0\refint\myfirstapi.dll
 D:\Project\BS Project\myfirstapi\obj\Debug\net8.0\myfirstapi.pdb
 D:\Project\BS Project\myfirstapi\obj\Debug\net8.0\myfirstapi.genruntimeconfig.cache
 D:\Project\BS Project\myfirstapi\obj\Debug\net8.0\ref\myfirstapi.dll
+D:\Project\BS Project\myfirstapi\obj\Debug\net8.0\myfirstapi.sourcelink.json
